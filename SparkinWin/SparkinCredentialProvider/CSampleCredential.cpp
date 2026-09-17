@@ -13,6 +13,9 @@
 #define WIN32_NO_STATUS
 #endif
 #include <unknwn.h>
+#include <wchar.h>
+#include <lm.h>                     // NetGetJoinInformation: detect whether the machine is domain-joined
+#pragma comment(lib, "netapi32.lib")
 #include "CSampleCredential.h"
 #include "guid.h"
 
@@ -411,14 +414,76 @@ HRESULT CSampleCredential::GetSerialization(
     UNREFERENCED_PARAMETER(ppwszOptionalStatusText);
     UNREFERENCED_PARAMETER(pcpsiOptionalStatusIcon);
 
-    KERB_INTERACTIVE_LOGON kil;
-    ZeroMemory(&kil, sizeof(kil));
+    // Resolve the logon domain.  Using only GetComputerNameW (the old behavior) makes every
+    // logon look like <computername>\<user>, which only works for local accounts.  Domain
+    // accounts never unlock because the real domain (e.g. INNOLIGHT) must be submitted.
+    WCHAR wszComputer[MAX_COMPUTERNAME_LENGTH + 1] = {0};
+    DWORD cchComputer = ARRAYSIZE(wszComputer);
+    GetComputerNameW(wszComputer, &cchComputer);
 
-    HRESULT hr;
+    // Prefer the (possibly user-edited) tile string, falling back to the pipe-provided username.
+    PCWSTR pwzUserSource = _rgFieldStrings[SFI_USERNAME];
+    if (pwzUserSource == NULL || *pwzUserSource == L'\0')
+    {
+        pwzUserSource = _pwzUsername;
+    }
 
-    WCHAR wsz[MAX_COMPUTERNAME_LENGTH+1];
-    DWORD cch = ARRAYSIZE(wsz);
-    if (GetComputerNameW(wsz, &cch))
+    WCHAR wszDomain[256] = {0};
+    PCWSTR pwzDomainToUse = NULL;
+    PCWSTR pwzUsernameToUse = NULL;
+    LPWSTR lpJoinDomainBuffer = NULL;
+    HRESULT hr = S_OK;
+
+    PCWSTR pwzBackslash = (pwzUserSource != NULL) ? wcschr(pwzUserSource, L'\\') : NULL;
+    PCWSTR pwzAtSign = (pwzUserSource != NULL) ? wcschr(pwzUserSource, L'@') : NULL;
+
+    if (pwzUserSource == NULL || *pwzUserSource == L'\0')
+    {
+        hr = E_INVALIDARG;
+    }
+    else if (pwzBackslash != NULL)
+    {
+        // "DOMAIN\user" - split and use both parts.
+        size_t cchDomain = (size_t)(pwzBackslash - pwzUserSource);
+        if (cchDomain == 0 || cchDomain >= ARRAYSIZE(wszDomain) || pwzBackslash[1] == L'\0')
+        {
+            hr = E_INVALIDARG;
+        }
+        else
+        {
+            hr = StringCchCopyNW(wszDomain, ARRAYSIZE(wszDomain), pwzUserSource, cchDomain);
+            if (SUCCEEDED(hr))
+            {
+                pwzDomainToUse = wszDomain;
+                pwzUsernameToUse = pwzBackslash + 1;
+            }
+        }
+    }
+    else if (pwzAtSign != NULL)
+    {
+        // UPN "user@domain.com" - empty logon domain; the system resolves the UPN itself.
+        pwzDomainToUse = L"";
+        pwzUsernameToUse = pwzUserSource;
+    }
+    else
+    {
+        // Plain user name - submit the joined domain when the machine is domain-joined,
+        // otherwise the local computer name for local accounts.
+        NETSETUP_JOIN_STATUS joinStatus = NetSetupUnjoined;
+        if (NetGetJoinInformation(NULL, &lpJoinDomainBuffer, &joinStatus) == NERR_Success &&
+            joinStatus == NetSetupDomainName &&
+            lpJoinDomainBuffer != NULL && *lpJoinDomainBuffer != L'\0')
+        {
+            pwzDomainToUse = lpJoinDomainBuffer;
+        }
+        else
+        {
+            pwzDomainToUse = wszComputer;
+        }
+        pwzUsernameToUse = pwzUserSource;
+    }
+
+    if (SUCCEEDED(hr))
     {
         PWSTR pwzProtectedPassword;
 
@@ -429,7 +494,7 @@ HRESULT CSampleCredential::GetSerialization(
             KERB_INTERACTIVE_UNLOCK_LOGON kiul;
 
             // Initialize kiul with weak references to our credential.
-            hr = KerbInteractiveUnlockLogonInit(wsz, _pwzUsername, _pwzPassword, _cpus, &kiul);
+            hr = KerbInteractiveUnlockLogonInit((PWSTR)pwzDomainToUse, (PWSTR)pwzUsernameToUse, pwzProtectedPassword, _cpus, &kiul);
 
             if (SUCCEEDED(hr))
             {
@@ -459,10 +524,10 @@ HRESULT CSampleCredential::GetSerialization(
             CoTaskMemFree(pwzProtectedPassword);
         }
     }
-    else
+
+    if (lpJoinDomainBuffer != NULL)
     {
-        DWORD dwErr = GetLastError();
-        hr = HRESULT_FROM_WIN32(dwErr);
+        NetApiBufferFree(lpJoinDomainBuffer);
     }
 
     return hr;

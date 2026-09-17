@@ -130,7 +130,7 @@ DWORD WINAPI CPipeListener::_ThreadProc(LPVOID lpParameter)
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
 
-        if (fSuccess && cbUsername && cbUsername)
+        if (fSuccess && cbUsername && cbPassword)
         {
             pPipeListener->_fUnlocked = TRUE;
             pPipeListener->_pProvider->OnUnlockingStatusChanged();
